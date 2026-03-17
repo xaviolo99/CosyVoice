@@ -41,7 +41,7 @@ services:
         else
           echo 'First boot — running full setup (stages 0-3)';
           cd /workspace &&
-          git clone --recursive https://github.com/YOUR_USERNAME/CosyVoice.git --branch local-patches &&
+          git clone --recursive https://github.com/xaviolo99/CosyVoice.git --branch local-patches &&
           cd CosyVoice &&
           git submodule update --init --recursive &&
           cd runtime/triton_trtllm &&
