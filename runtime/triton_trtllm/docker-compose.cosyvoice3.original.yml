@@ -1,0 +1,29 @@
+services:
+  tts:
+    image: soar97/triton-cosyvoice:25.06
+    shm_size: '2gb'
+    ports:
+      - "8000:8000"   # Triton HTTP  (NOTE: actually Triton runs on 18000 — ports are wrong upstream)
+      - "8001:8001"   # Triton gRPC  (NOTE: actually Triton runs on 18001)
+      - "8002:8002"   # Triton metrics (NOTE: actually Triton runs on 18002)
+    environment:
+      - PYTHONIOENCODING=utf-8
+      - MODEL_ID=${MODEL_ID}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    # WARNING: always re-clones, re-downloads, and re-compiles TRT engines on every start (~20 min)
+    # Use docker-compose.cosyvoice3.yml instead for a persistent workspace
+    command: >
+      /bin/bash -c "
+        cd /workspace &&
+        git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git &&
+        cd CosyVoice &&
+        git submodule update --init --recursive &&
+        cd runtime/triton_trtllm &&
+        bash run_cosyvoice3.sh 0 3
+      "
