@@ -137,7 +137,7 @@ class TritonPythonModel:
             embedding = self._extract_spk_embedding(wav_array)
 
             prompt_spk_embedding_tensor = pb_utils.Tensor.from_dlpack(
-                "prompt_spk_embedding", to_dlpack(embedding))
+                "prompt_spk_embedding", to_dlpack(embedding.cpu()))  # .cpu() avoids CUDA IPC on WSL2
             inference_response = pb_utils.InferenceResponse(
                 output_tensors=[prompt_spk_embedding_tensor])
 

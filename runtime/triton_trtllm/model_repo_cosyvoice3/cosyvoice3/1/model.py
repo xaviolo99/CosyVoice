@@ -197,14 +197,16 @@ class TritonPythonModel:
                                 request_id, token_offset=None, finalize=True,
                                 priority=100):
         """Async BLS call to token2wav (flow-only). Returns mel tensor."""
+        # .cpu() on all inputs: token2wav is KIND_CPU to avoid CUDA IPC on WSL2;
+        # token2wav/model.py moves tensors back to GPU internally via .to(self.device).
         target_tokens_pb = pb_utils.Tensor.from_dlpack(
-            "target_speech_tokens", to_dlpack(target_speech_tokens))
+            "target_speech_tokens", to_dlpack(target_speech_tokens.cpu()))
         prompt_tokens_pb = pb_utils.Tensor.from_dlpack(
-            "prompt_speech_tokens", to_dlpack(prompt_speech_tokens))
+            "prompt_speech_tokens", to_dlpack(prompt_speech_tokens.cpu()))
         prompt_feat_pb = pb_utils.Tensor.from_dlpack(
-            "prompt_speech_feat", to_dlpack(prompt_speech_feat))
+            "prompt_speech_feat", to_dlpack(prompt_speech_feat.cpu()))
         prompt_emb_pb = pb_utils.Tensor.from_dlpack(
-            "prompt_spk_embedding", to_dlpack(prompt_spk_embedding))
+            "prompt_spk_embedding", to_dlpack(prompt_spk_embedding.cpu()))
 
         inputs = [target_tokens_pb, prompt_tokens_pb, prompt_feat_pb, prompt_emb_pb]
 
@@ -266,21 +268,31 @@ class TritonPythonModel:
             return (cached['prompt_speech_tokens_for_llm'], cached['prompt_speech_tokens'],
                     cached['prompt_speech_feat'], cached['prompt_spk_embedding'], reference_text)
 
-        # Audio tokenizer
+        # wav arrives at 24kHz (notebook resamples to 24k before sending).
+        # The audio tokenizer and speaker embedding models expect 16kHz input,
+        # so we resample down here.  The mel extraction uses the 24kHz audio
+        # directly — this matches the transformers path (frontend.py load_wav 24000)
+        # and avoids the 16k→24k upsample that previously stripped frequencies
+        # above 8kHz and caused the "underwater" quality degradation.
         wav_np = wav.as_numpy()
         wav_len_val = wav_len.as_numpy()[0][0]
-        prompt_speech_tokens = self.forward_audio_tokenizer(wav, wav_len)
+        wav_tensor_24k = torch.from_numpy(wav_np)[:, :wav_len_val]
+
+        # Resample 24k→16k for tokenizer and speaker embedding
+        wav_tensor_16k = torchaudio.functional.resample(wav_tensor_24k, orig_freq=24000, new_freq=16000)
+        wav_16k_np = wav_tensor_16k.numpy().astype(np.float32)
+        wav_16k_len = np.array([[wav_16k_np.shape[1]]], dtype=np.int32)
+        wav_16k_pb = pb_utils.Tensor("reference_wav", wav_16k_np)
+        wav_16k_len_pb = pb_utils.Tensor("reference_wav_len", wav_16k_len)
+
+        prompt_speech_tokens = self.forward_audio_tokenizer(wav_16k_pb, wav_16k_len_pb)
         prompt_speech_tokens = prompt_speech_tokens.unsqueeze(0)  # [1, T]
 
-        # Speaker embedding
-        wav_tensor = torch.from_numpy(wav_np)
-        wav_tensor = wav_tensor[:, :wav_len_val]
-        prompt_spk_embedding = self.forward_speaker_embedding(wav_tensor)
+        # Speaker embedding (16kHz)
+        prompt_spk_embedding = self.forward_speaker_embedding(wav_tensor_16k)
 
-        # Mel extraction at 24kHz with CosyVoice3 params
-        prompt_speech_resample = torchaudio.transforms.Resample(
-            orig_freq=16000, new_freq=24000)(wav_tensor)
-        speech_feat = self._extract_speech_feat(prompt_speech_resample)
+        # Mel extraction directly from 24kHz audio — full frequency content preserved
+        speech_feat = self._extract_speech_feat(wav_tensor_24k)
 
         # Keep full tokens for LLM prefill (untruncated)
         prompt_speech_tokens_for_llm = prompt_speech_tokens.clone()

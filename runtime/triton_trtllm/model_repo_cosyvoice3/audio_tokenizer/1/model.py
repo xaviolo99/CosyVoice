@@ -82,7 +82,7 @@ class TritonPythonModel:
         for i in range(len(requests)):
             prompt_speech_tokens = codes[i, :codes_lens[i].item()]
             prompt_speech_tokens_tensor = pb_utils.Tensor.from_dlpack(
-                "prompt_speech_tokens", to_dlpack(prompt_speech_tokens))
+                "prompt_speech_tokens", to_dlpack(prompt_speech_tokens.cpu()))  # .cpu() avoids CUDA IPC on WSL2
             inference_response = pb_utils.InferenceResponse(
                 output_tensors=[prompt_speech_tokens_tensor])
             responses.append(inference_response)

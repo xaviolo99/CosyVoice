@@ -1,14 +1,26 @@
 services:
   tts:
     image: soar97/triton-cosyvoice:25.06
-    shm_size: '1gb'
+    shm_size: '2gb'
+    ipc: host   # required on WSL2: CUDA IPC (cudaIpcOpenMemHandle) needs host IPC namespace
     ports:
-      - "8000:8000"
-      - "8001:8001"
-      - "8002:8002"
+      - "8000:8000"    # trtllm-serve (OpenAI-compatible LLM API, used internally by Triton)
+      - "18000:18000"  # Triton HTTP
+      - "18001:18001"  # Triton gRPC  ← use this from the notebook
+      - "18002:18002"  # Triton metrics
     environment:
       - PYTHONIOENCODING=utf-8
       - MODEL_ID=${MODEL_ID}
+    volumes:
+      # Large artifacts (TRT engines, downloaded HF models, model_repo_copy) live in a
+      # named volume so they survive container rebuilds without re-downloading.
+      - cosyvoice3_workspace:/workspace
+      # Bind-mount the LOCAL patched model_repo_cosyvoice3 source ON TOP of the named
+      # volume.  Docker's mount layering means this directory always reflects the local
+      # git-tracked patches.  Stage 2 (run_cosyvoice3.sh) cp -r's from this source into
+      # model_repo_cosyvoice3_copy, so patches automatically flow in whenever the copy
+      # is rebuilt — no fork or internet access needed for source changes.
+      - ./model_repo_cosyvoice3:/workspace/CosyVoice/runtime/triton_trtllm/model_repo_cosyvoice3:ro
     deploy:
       resources:
         reservations:
@@ -16,5 +28,27 @@ services:
             - driver: nvidia
               device_ids: ['0']
               capabilities: [gpu]
+    # First boot:     clones upstream repo + downloads HF models + compiles TRT engines (~20 min)
+    # Subsequent boots: skips straight to starting the servers (seconds)
+    # Source patches:   always come from the bind-mounted ./model_repo_cosyvoice3 (see above)
     command: >
-      /bin/bash -c "cd /workspace && git clone https://github.com/FunAudioLLM/CosyVoice.git && cd CosyVoice && git submodule update --init --recursive && cd runtime/triton_trtllm && bash run_cosyvoice3.sh 0 3"
+      /bin/bash -c "
+        TRT_ENGINES=/workspace/CosyVoice/runtime/triton_trtllm/trt_engines_bfloat16;
+        MODEL_REPO=/workspace/CosyVoice/runtime/triton_trtllm/model_repo_cosyvoice3_copy;
+        if [ -d \"$$TRT_ENGINES\" ] && [ -d \"$$MODEL_REPO\" ]; then
+          echo 'Workspace already set up — skipping to stage 3 (start servers)';
+          cd /workspace/CosyVoice/runtime/triton_trtllm && bash run_cosyvoice3.sh 3 3;
+        else
+          echo 'First boot — running full setup (stages 0-3)';
+          cd /workspace &&
+          git clone --recursive https://github.com/YOUR_USERNAME/CosyVoice.git --branch local-patches &&
+          cd CosyVoice &&
+          git submodule update --init --recursive &&
+          cd runtime/triton_trtllm &&
+          bash run_cosyvoice3.sh 0 3;
+        fi
+      "
+
+volumes:
+  cosyvoice3_workspace:
+    driver: local

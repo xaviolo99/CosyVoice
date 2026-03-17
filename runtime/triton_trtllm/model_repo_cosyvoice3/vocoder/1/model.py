@@ -61,7 +61,7 @@ class TritonPythonModel:
             speech = speech.squeeze()  # flatten to [S]
 
             speech_tensor = pb_utils.Tensor.from_dlpack(
-                "tts_speech", to_dlpack(speech.unsqueeze(0)))  # [1, S] for batch dim
+                "tts_speech", to_dlpack(speech.unsqueeze(0).cpu()))  # .cpu() avoids CUDA IPC on WSL2
             inference_response = pb_utils.InferenceResponse(
                 output_tensors=[speech_tensor])
             responses.append(inference_response)
