@@ -1,7 +1,9 @@
+import hashlib
 import json
 import re
 import time
 import asyncio
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -66,8 +68,10 @@ class TritonPythonModel:
         self.http_client = httpx.AsyncClient()
         self.api_base = model_params.get("llm_api_base", "http://localhost:8000/v1/chat/completions")
 
-        # Speaker cache to avoid redundant audio_tokenizer/speaker_embedding calls
+        # Speaker cache: in-memory (per instance) + disk (shared across instances, survives restarts)
         self.speaker_cache = {}
+        self.speaker_disk_cache_dir = Path("/workspace/speaker_cache")
+        self.speaker_disk_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _convert_speech_tokens_to_str(self, speech_tokens):
         """Convert speech token IDs tensor/list to string like '<|s_N|>'."""
@@ -81,10 +85,9 @@ class TritonPythonModel:
         speech_feat = speech_feat.unsqueeze(dim=0).to(self.device)
         return speech_feat
 
-    async def forward_llm_streaming(self, target_text, reference_text, prompt_speech_tokens):
+    async def forward_llm_streaming(self, target_text, reference_text, prompt_speech_tokens_str):
         """Async generator: stream LLM tokens via httpx SSE."""
         full_text = f"{reference_text}{target_text}"
-        prompt_speech_tokens_str = self._convert_speech_tokens_to_str(prompt_speech_tokens)
 
         chat = [
             {"role": "user", "content": full_text},
@@ -136,10 +139,9 @@ class TritonPythonModel:
             yield token_num
             buffer = buffer[match.end():]
 
-    async def forward_llm_offline(self, target_text, reference_text, prompt_speech_tokens):
+    async def forward_llm_offline(self, target_text, reference_text, prompt_speech_tokens_str):
         """Non-streaming LLM call, returns all speech token IDs at once."""
         full_text = f"{reference_text}{target_text}"
-        prompt_speech_tokens_str = self._convert_speech_tokens_to_str(prompt_speech_tokens)
 
         chat = [
             {"role": "user", "content": full_text},
@@ -262,57 +264,102 @@ class TritonPythonModel:
         if '<|endofprompt|>' not in reference_text:
             reference_text = 'You are a helpful assistant.<|endofprompt|>' + reference_text
 
-        # Check speaker cache
-        if reference_text in self.speaker_cache:
-            cached = self.speaker_cache[reference_text]
+        # Check speaker cache (keyed by wav fingerprint + reference_text).
+        # Fingerprint = first+last 256 bytes + shape: O(1) cost, collision-free for audio.
+        # reference_text is included so same wav with different emotion prompts gets its own entry.
+        _t_hash = time.perf_counter()
+        wav_np = wav.as_numpy()
+        # Cache key is wav-only: speaker embedding / mel / speech tokens are purely audio-derived.
+        # reference_text (emotion, instruction) only affects LLM behavior and is not cached.
+        mid = wav_np.shape[1] // 2
+        fingerprint = (wav_np[:, :256].tobytes() + wav_np[:, mid:mid+256].tobytes() +
+                       wav_np[:, -256:].tobytes() + str(wav_np.shape).encode())
+        cache_key = hashlib.md5(fingerprint).hexdigest()
+        self.logger.log_info(f"[perf] cache key took {(time.perf_counter() - _t_hash) * 1000:.3f}ms")
+        if cache_key in self.speaker_cache:
+            self.logger.log_info(f"[perf] memory cache HIT")
+            cached = self.speaker_cache[cache_key]
             return (cached['prompt_speech_tokens_for_llm'], cached['prompt_speech_tokens'],
-                    cached['prompt_speech_feat'], cached['prompt_spk_embedding'], reference_text)
+                    cached['prompt_speech_feat'], cached['prompt_spk_embedding'],
+                    reference_text, cached['prompt_speech_tokens_str'])
 
+        disk_path = self.speaker_disk_cache_dir / f"{cache_key}.pt"
+        if disk_path.exists():
+            _t = time.perf_counter()
+            cached = torch.load(disk_path, map_location='cpu', weights_only=True)
+            if 'prompt_speech_tokens_str' not in cached:
+                cached['prompt_speech_tokens_str'] = self._convert_speech_tokens_to_str(
+                    cached['prompt_speech_tokens_for_llm'])
+                torch.save(cached, disk_path)
+            self.speaker_cache[cache_key] = cached
+            self.logger.log_info(f"[perf] disk cache HIT, loaded in {(time.perf_counter() - _t) * 1000:.2f}ms")
+            return (cached['prompt_speech_tokens_for_llm'], cached['prompt_speech_tokens'],
+                    cached['prompt_speech_feat'], cached['prompt_spk_embedding'],
+                    reference_text, cached['prompt_speech_tokens_str'])
+
+        self.logger.log_info(f"[perf] cache MISS — computing prompt features")
         # wav arrives at 24kHz (notebook resamples to 24k before sending).
         # The audio tokenizer and speaker embedding models expect 16kHz input,
         # so we resample down here.  The mel extraction uses the 24kHz audio
         # directly — this matches the transformers path (frontend.py load_wav 24000)
         # and avoids the 16k→24k upsample that previously stripped frequencies
         # above 8kHz and caused the "underwater" quality degradation.
-        wav_np = wav.as_numpy()
         wav_len_val = wav_len.as_numpy()[0][0]
         wav_tensor_24k = torch.from_numpy(wav_np)[:, :wav_len_val]
 
         # Resample 24k→16k for tokenizer and speaker embedding
+        _t = time.perf_counter()
         wav_tensor_16k = torchaudio.functional.resample(wav_tensor_24k, orig_freq=24000, new_freq=16000)
         wav_16k_np = wav_tensor_16k.numpy().astype(np.float32)
         wav_16k_len = np.array([[wav_16k_np.shape[1]]], dtype=np.int32)
         wav_16k_pb = pb_utils.Tensor("reference_wav", wav_16k_np)
         wav_16k_len_pb = pb_utils.Tensor("reference_wav_len", wav_16k_len)
+        self.logger.log_info(f"[perf] resample 24k→16k took {(time.perf_counter() - _t) * 1000:.2f}ms")
 
+        _t = time.perf_counter()
         prompt_speech_tokens = self.forward_audio_tokenizer(wav_16k_pb, wav_16k_len_pb)
         prompt_speech_tokens = prompt_speech_tokens.unsqueeze(0)  # [1, T]
+        self.logger.log_info(f"[perf] audio_tokenizer took {(time.perf_counter() - _t) * 1000:.2f}ms")
 
         # Speaker embedding (16kHz)
+        _t = time.perf_counter()
         prompt_spk_embedding = self.forward_speaker_embedding(wav_tensor_16k)
+        self.logger.log_info(f"[perf] speaker_embedding took {(time.perf_counter() - _t) * 1000:.2f}ms")
 
         # Mel extraction directly from 24kHz audio — full frequency content preserved
+        _t = time.perf_counter()
         speech_feat = self._extract_speech_feat(wav_tensor_24k)
+        self.logger.log_info(f"[perf] mel extraction took {(time.perf_counter() - _t) * 1000:.2f}ms")
 
         # Keep full tokens for LLM prefill (untruncated)
         prompt_speech_tokens_for_llm = prompt_speech_tokens.clone()
 
+        # Pre-compute token string for LLM (avoid repeated conversion on every call)
+        _t = time.perf_counter()
+        prompt_speech_tokens_str = self._convert_speech_tokens_to_str(prompt_speech_tokens_for_llm)
+        self.logger.log_info(f"[perf] token str conversion took {(time.perf_counter() - _t) * 1000:.2f}ms "
+                             f"({prompt_speech_tokens_for_llm.shape[-1]} tokens)")
+
         # Align prompt speech feat and tokens to 2:1 ratio (for flow model only)
-        orig_feat_len = speech_feat.shape[1]
-        orig_token_len = prompt_speech_tokens.shape[-1]
         token_len = min(int(speech_feat.shape[1] / 2), prompt_speech_tokens.shape[-1])
         prompt_speech_feat = speech_feat[:, :2 * token_len].contiguous().half()
         prompt_speech_tokens = prompt_speech_tokens[:, :token_len].contiguous()
 
-        # Cache
-        self.speaker_cache[reference_text] = {
+        # Cache in memory and persist to disk (shared across instances, survives restarts)
+        cached = {
             'prompt_speech_tokens_for_llm': prompt_speech_tokens_for_llm,
             'prompt_speech_tokens': prompt_speech_tokens,
             'prompt_speech_feat': prompt_speech_feat,
             'prompt_spk_embedding': prompt_spk_embedding,
+            'prompt_speech_tokens_str': prompt_speech_tokens_str,
         }
+        self.speaker_cache[cache_key] = cached
+        _t = time.perf_counter()
+        torch.save(cached, disk_path)
+        self.logger.log_info(f"[perf] saved to disk cache in {(time.perf_counter() - _t) * 1000:.2f}ms")
 
-        return prompt_speech_tokens_for_llm, prompt_speech_tokens, prompt_speech_feat, prompt_spk_embedding, reference_text
+        return (prompt_speech_tokens_for_llm, prompt_speech_tokens, prompt_speech_feat,
+                prompt_spk_embedding, reference_text, prompt_speech_tokens_str)
 
     async def _process_request_streaming(self, request):
         """Process a single request in streaming (decoupled) mode."""
@@ -321,7 +368,7 @@ class TritonPythonModel:
 
         try:
             prompt_speech_tokens_for_llm, prompt_speech_tokens, prompt_speech_feat, \
-                prompt_spk_embedding, reference_text = self._prepare_prompt(request)
+                prompt_spk_embedding, reference_text, prompt_speech_tokens_str = self._prepare_prompt(request)
 
             target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
             target_text = target_text[0][0].decode('utf-8')
@@ -332,13 +379,21 @@ class TritonPythonModel:
             this_token_hop_len = self.token_hop_len
             accumulated_mel = None
             speech_offset = 0
+            t_request = time.perf_counter()
+            t_first_llm_token = None
             start_time = time.time()
 
             async for generated_id in self.forward_llm_streaming(
                 target_text=target_text,
                 reference_text=reference_text,
-                prompt_speech_tokens=prompt_speech_tokens_for_llm,
+                prompt_speech_tokens_str=prompt_speech_tokens_str,
             ):
+                if t_first_llm_token is None:
+                    t_first_llm_token = time.perf_counter()
+                    self.logger.log_info(
+                        f"[ttfa] LLM prefill+first_token: {(t_first_llm_token - t_request) * 1000:.1f}ms"
+                        f"  target_text_len={len(target_text)}"
+                    )
                 semantic_token_ids_arr.append(generated_id)
 
                 while True:
@@ -353,12 +408,20 @@ class TritonPythonModel:
                     ).unsqueeze(0).to(torch.int32).to(self.device)
 
                     # Call token2wav (flow-only) -> mel_chunk
+                    if chunk_index == 0:
+                        t_chunk0 = time.perf_counter()
+                        self.logger.log_info(
+                            f"[ttfa] 18 tokens accumulated: {(t_chunk0 - t_request) * 1000:.1f}ms total  "
+                            f"(+{(t_chunk0 - t_first_llm_token) * 1000:.1f}ms after first token)"
+                        )
                     mel_chunk = await self.forward_token2wav(
                         this_tokens, prompt_speech_tokens,
                         prompt_speech_feat, prompt_spk_embedding,
                         request_id, token_offset=token_offset, finalize=False,
                         priority=chunk_index + 1,
                     )
+                    if chunk_index == 0:
+                        self.logger.log_info(f"[ttfa] token2wav: {(time.perf_counter() - t_chunk0) * 1000:.1f}ms")
 
                     # Accumulate mel
                     if mel_chunk.dim() == 2:
@@ -369,7 +432,14 @@ class TritonPythonModel:
                         accumulated_mel = torch.cat([accumulated_mel, mel_chunk], dim=2)
 
                     # Call vocoder
+                    t_voc = time.perf_counter() if chunk_index == 0 else None
                     speech = await self.forward_vocoder(accumulated_mel, finalize=False)
+
+                    if chunk_index == 0 and t_voc is not None:
+                        self.logger.log_info(
+                            f"[ttfa] vocoder: {(time.perf_counter() - t_voc) * 1000:.1f}ms  "
+                            f"total_server: {(time.perf_counter() - t_request) * 1000:.1f}ms"
+                        )
 
                     # Extract new speech
                     new_speech = speech[:, speech_offset:]
@@ -448,7 +518,7 @@ class TritonPythonModel:
         request_id = request.request_id()
 
         prompt_speech_tokens_for_llm, prompt_speech_tokens, prompt_speech_feat, \
-            prompt_spk_embedding, reference_text = self._prepare_prompt(request)
+            prompt_spk_embedding, reference_text, prompt_speech_tokens_str = self._prepare_prompt(request)
 
         target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
         target_text = target_text[0][0].decode('utf-8')
@@ -457,7 +527,7 @@ class TritonPythonModel:
         all_token_ids = await self.forward_llm_offline(
             target_text=target_text,
             reference_text=reference_text,
-            prompt_speech_tokens=prompt_speech_tokens_for_llm,
+            prompt_speech_tokens_str=prompt_speech_tokens_str,
         )
 
         if len(all_token_ids) == 0:

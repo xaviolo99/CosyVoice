@@ -11,6 +11,7 @@ services:
     environment:
       - PYTHONIOENCODING=utf-8
       - MODEL_ID=${MODEL_ID}
+      - BLS_INSTANCE_NUM=${BLS_INSTANCE_NUM:-4}
     volumes:
       # Large artifacts (TRT engines, downloaded HF models, model_repo_copy) live in a
       # named volume so they survive container rebuilds without re-downloading.
@@ -35,6 +36,8 @@ services:
       /bin/bash -c "
         TRT_ENGINES=/workspace/CosyVoice/runtime/triton_trtllm/trt_engines_bfloat16;
         MODEL_REPO=/workspace/CosyVoice/runtime/triton_trtllm/model_repo_cosyvoice3_copy;
+        echo 'Installing Python dependencies (not persisted across container recreation)...';
+        pip3 install --quiet --upgrade x_transformers s3tokenizer;
         if [ -d \"$$TRT_ENGINES\" ] && [ -d \"$$MODEL_REPO\" ]; then
           echo 'Workspace already set up — skipping to stage 3 (start servers)';
           cd /workspace/CosyVoice/runtime/triton_trtllm && bash run_cosyvoice3.sh 3 3;
